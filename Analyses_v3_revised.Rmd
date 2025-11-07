@@ -1,0 +1,978 @@
+---
+title: "The Epidemiology of Isolates from Blood Culture in Norway 2005-2024"
+author: "Anders Skyrud Danielsen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: pdflatex
+---
+
+## Setup
+
+```{r setup, echo=FALSE}
+
+# Load required packages
+pacman::p_load(
+  readxl,
+  gtsummary,
+  gt,
+  knitr, 
+  ggrepel,
+  viridis,
+  MASS,
+  stats,
+  AER,
+  broom,
+  scales,
+  tidyverse,
+  patchwork, 
+  GGally,
+  ggsankey,
+  shadowtext,
+  scales,
+  mice,
+  splines,
+  rms,
+  ggpubr,
+  vegan
+)
+
+Sys.setlocale(category = "LC_CTYPE", locale = "Norwegian_Norway.utf8")
+options(scipen=999)
+
+# Load data
+data <- read_csv2("C:/Users/ANSD/OneDrive - Folkehelseinstituttet/Forskning og analyse - Resistens- og infeksjonsforebygging/Speciesfordeling i blod/data_v3.csv", locale = locale(encoding = "UTF-8"), col_types = "n")  %>%
+  mutate(Age_70_pct = as.numeric(Age_70_pct)*100) %>% 
+  mutate(Blood_culture_positivity = Blood_culture_positivity*100) %>% 
+  mutate(Blood_cultures_OUS = Blood_cultures_Rikshospitalet+Blood_cultures_Ullevål) %>% 
+  mutate(Age_80_pct = ((Age_80_89+Age_90)/Population_size)*100)
+
+# Categories of microbes
+species_vars <- c(
+  "Staphylococcus_aureus",
+  "Coagulase_negative_staphylococci",
+  "Streptococcus_pneumoniae",
+  "Streptococcus_pyogenes",
+  "Streptococcus_agalactiae",
+  "Beta_haemolytic_streptococci_group_C_G",
+  "Viridans_and_non_haemolytic_streptococci",
+  "Enterococcus_faecalis",
+  "Enterococcus_faecium",
+  "Other_Gram_positive",
+  "Escherichia_coli",
+  "Klebsiella_spp",
+  "Enterobacter_spp",
+  "Proteus_spp",
+  "Other_Enterobacteriaceae",
+  "Pseudomonas_spp",
+  "Acinetobacter_spp",
+  "Other_Gram_negatives_aerobic_bacteria",
+  "Bacteroides_spp",
+  "Other_anaerobic_bacteria",
+  "Yeasts"
+)
+
+# Display a preview of relevant variables
+data %>%
+  select(Year, Total_isolates, Population_size, Mean_age, Age_70_pct, 
+         Bed_days, Diagnoses_per_stay, Prednisolone) %>%
+  knitr::kable()
+
+```
+
+## Imputation
+
+```{r imputation}
+
+# Select relevant variables for imputation
+imp_data <- data %>%
+  select(Hospital_stays, Unique_patients)
+
+# Perform imputation (m = 5 datasets, predictive mean matching)
+imp <- mice(imp_data, m = 5, method = "pmm", seed = 42)
+
+# Get completed data
+completed_data <- complete(imp)
+
+# Merge imputed Unique_patients back into the original data
+data <- data %>%
+  mutate(Unique_patients = completed_data$Unique_patients)
+
+```
+
+```{r rate calculation}
+
+# Rate calculation
+
+# Variables to convert into rates (per 100,000)
+rate_vars <- c(
+  "Bed_days",
+  "Hospital_stays",
+  "Unique_patients",
+  "Prednisolone",
+  "Cancer_incidence",
+  "Haematopoietic_cancer_incidence",
+  "Gastrointestinal_cancer_incidence",
+  "Total_blood_cultures",
+  "Total_isolates",
+  species_vars
+)
+
+# Create new columns in data with suffix "_rate"
+data <- data %>%
+  mutate(across(
+    all_of(rate_vars),
+    ~ (.x / Population_size) * 1e5,
+    .names = "{.col}_rate"
+  ))
+
+```
+
+
+## Bootstrapping
+
+```{r bootstrapping}
+
+# Overdispersion test
+pois_fit <- glm(Total_isolates ~ 1, data = data, family = poisson)
+dispersiontest(pois_fit) #overdispersed
+
+# Bootstrap function 
+bootstrap_positivity_nb <- function(data, n_boot = 10000, conf = 0.95, seed = 123) {
+  required_cols <- c("Population_size","Blood_cultures_HMN","Blood_cultures_Tromsø_50",
+                     "Catchment_area_HMN","Catchment_area_Tromsø","Total_isolates",
+                     "Total_blood_cultures","Blood_culture_positivity")
+
+  set.seed(seed)
+  alpha <- (1 - conf) / 2
+  qlo <- alpha
+  qhi <- 1 - alpha
+
+  # Estimate dispersion (theta) for each count series with intercept-only NB models
+  nb_theta <- function(x) {
+    x <- as.numeric(x)
+    fit <- glm.nb(x ~ 1)
+    unname(fit$theta)
+  }
+  theta_iso <- nb_theta(data$Total_isolates)
+  theta_hmn <- nb_theta(data$Blood_cultures_HMN)
+  theta_tro <- nb_theta(data$Blood_cultures_Tromsø_50)
+
+  # Row-wise bootstrap: returns CI for total blood cultures and positivity
+  boot_row <- function(Pop, B_HMN, B_TRO, C_HMN, C_TRO, Iso) {
+    b_hmn <- rnbinom(n_boot, size = theta_hmn, mu = B_HMN)
+    b_tro <- rnbinom(n_boot, size = theta_tro,  mu = B_TRO)
+    iso   <- rnbinom(n_boot, size = theta_iso,  mu = Iso)
+
+    denom <- Pop * ((b_hmn + b_tro) / (C_HMN + C_TRO))
+    denom[denom <= 0] <- NA_real_
+
+    pos <- iso / denom
+
+    # Quantiles for denominator (counts) and positivity (fraction)
+    denom_lcl <- stats::quantile(denom, probs = qlo, na.rm = TRUE, names = FALSE)
+    denom_ucl <- stats::quantile(denom, probs = qhi, na.rm = TRUE, names = FALSE)
+
+    pos_lcl <- stats::quantile(pos,   probs = qlo, na.rm = TRUE, names = FALSE)
+    pos_ucl <- stats::quantile(pos,   probs = qhi, na.rm = TRUE, names = FALSE)
+
+    # Convert positivity CIs to percent (×100)
+    c(denom_lcl, denom_ucl, 100 * pos_lcl, 100 * pos_ucl)
+  }
+
+  ci_mat <- mapply(
+    boot_row,
+    Pop = data$Population_size,
+    B_HMN = data$Blood_cultures_HMN,
+    B_TRO = data$Blood_cultures_Tromsø_50,
+    C_HMN = data$Catchment_area_HMN,
+    C_TRO = data$Catchment_area_Tromsø,
+    Iso   = data$Total_isolates
+  )
+
+  ci_df <- as.data.frame(t(ci_mat))
+  names(ci_df) <- c("Total_blood_cultures_LCL", "Total_blood_cultures_UCL",
+                    "Blood_culture_positivity_LCL_pct", "Blood_culture_positivity_UCL_pct")
+
+  cbind(data, ci_df)
+}
+
+data <- bootstrap_positivity_nb(data, n_boot = 10000, conf = 0.95, seed = 123)
+
+```
+
+
+## Table 1
+
+```{r table 1, echo=FALSE}
+
+# Select relevant variables and filter for 2004 and 2024
+table1_data <- data %>%
+  filter(Year %in% c(2005, 2024)) %>%
+  select(
+    Year,
+    Population_size,
+    Mean_age,
+    Age_70_pct,
+    Bed_days, Bed_days_rate,
+    Hospital_stays, Hospital_stays_rate,
+    Unique_patients, Unique_patients_rate,
+    Diagnoses_per_stay,
+    Prednisolone, Prednisolone_rate,
+    Cancer_incidence, Cancer_incidence_rate,
+    Haematopoietic_cancer_incidence, Haematopoietic_cancer_incidence_rate,
+    Gastrointestinal_cancer_incidence, Gastrointestinal_cancer_incidence_rate,
+    Blood_cultures_Rikshospitalet,
+    Blood_cultures_Ullevål,
+    Total_blood_cultures, Total_blood_cultures_rate,
+    Blood_culture_positivity,
+    Total_isolates, Total_isolates_rate,
+    Coagulase_negative_staphylococci, Coagulase_negative_staphylococci_rate
+  ) %>%
+  pivot_longer(-Year, names_to = "Variable", values_to = "Value") %>%
+  pivot_wider(names_from = Year, values_from = Value) %>%
+  mutate(
+    Change_percent = round(((`2024` - `2005`) / `2005`) * 100, 1)
+  )
+
+# Create pretty table
+gt_table1 <- table1_data %>%
+  gt() %>%
+  cols_label(
+    Variable = "Variable",
+    `2005` = "2005",
+    `2024` = "2024",
+    Change_percent = "% change"
+  ) %>%
+  fmt_number(
+    columns = c(`2005`, `2024`),
+    decimals = 0
+  ) %>%
+  fmt_number(
+    columns = Change_percent,
+    decimals = 1,
+    pattern = "{x}%"
+  ) %>%
+  fmt_number(
+    columns = c(`2005`, `2024`),
+    rows = Variable %in% c("Proportion >70 years old", "Blood culture positivity (estimated)"),
+    decimals = 2,
+    pattern = "{x}%"
+  )
+
+# Print the table
+gt_table1
+
+#gtsave(gt_table1, "table_1.docx", expand = TRUE)
+
+```
+
+## Table 2
+
+```{r table 2}
+
+# Reshape species counts (wide -> long)
+df_species_counts <- data %>%
+  select(Year, all_of(species_vars)) %>%
+  pivot_longer(cols = -Year, names_to = "Species", values_to = "Count")
+
+# Reshape species rates (wide -> long), using the existing *_rate columns
+df_species_rates <- data %>%
+  select(Year, all_of(paste0(species_vars, "_rate"))) %>%
+  pivot_longer(cols = -Year, names_to = "Species_rate", values_to = "Rate_per_100k") %>%
+  mutate(Species = sub("_rate$", "", Species_rate)) %>%
+  select(Year, Species, Rate_per_100k)
+
+# Combine counts + rates
+df_species_long <- df_species_counts %>%
+  left_join(df_species_rates, by = c("Year", "Species"))
+
+# Filter for 2005 and 2024 and widen to counts + rates
+species_table_data <- df_species_long %>%
+  filter(Year %in% c(2005, 2024)) %>%
+  pivot_wider(
+    names_from = Year,
+    values_from = c(Count, Rate_per_100k),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    Change_percent = round((Count_2024 - Count_2005) / Count_2005 * 100, 1),
+    Rate_change_percent = round((Rate_per_100k_2024 - Rate_per_100k_2005) / Rate_per_100k_2005 * 100, 1)
+  ) %>%
+  mutate(Species = gsub("_", " ", Species))
+
+# --- Add total row ---
+total_row <- species_table_data %>%
+  summarise(
+    Species = "Total",
+    Count_2005 = sum(Count_2005, na.rm = TRUE),
+    Count_2024 = sum(Count_2024, na.rm = TRUE),
+    Change_percent = round((Count_2024 - Count_2005) / Count_2005 * 100, 1),
+    Rate_per_100k_2005 = sum(Rate_per_100k_2005, na.rm = TRUE),
+    Rate_per_100k_2024 = sum(Rate_per_100k_2024, na.rm = TRUE),
+    Rate_change_percent = round((Rate_per_100k_2024 - Rate_per_100k_2005) / Rate_per_100k_2005 * 100, 1)
+  )
+
+# Append total row
+species_table_data <- bind_rows(species_table_data, total_row)
+
+# Create gt table
+gt_species_table <- species_table_data %>%
+  gt() %>%
+  cols_label(
+    Species = "Species",
+    Count_2005 = "2005",
+    Count_2024 = "2024",
+    Change_percent = "% change",
+    Rate_per_100k_2005 = "2005",
+    Rate_per_100k_2024 = "2024",
+    Rate_change_percent = "% change"
+  ) %>%
+  tab_spanner(label = "Absolute counts",
+              columns = c(Count_2005, Count_2024, Change_percent)) %>%
+  tab_spanner(label = "Rate per 100,000 people",
+              columns = c(Rate_per_100k_2005, Rate_per_100k_2024, Rate_change_percent)) %>%
+  fmt_number(columns = c(Count_2005, Count_2024), decimals = 0) %>%
+  fmt_number(columns = Change_percent, decimals = 1, pattern = "{x}%") %>%
+  fmt_number(columns = c(Rate_per_100k_2005, Rate_per_100k_2024), decimals = 0) %>%
+  fmt_number(columns = Rate_change_percent, decimals = 1, pattern = "{x}%") %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(rows = Species == "Total")
+  )
+
+# Print table
+gt_species_table
+
+#gtsave(gt_species_table, "table 2.docx", expand = TRUE)
+
+```
+
+## Figure 1
+
+```{r figure 1, fig.width=14, fig.height=10,echo = F}
+
+# Mapping of variable names to clean species labels
+species_labels <- c(
+  "Staphylococcus_aureus" = "Staphylococcus aureus",
+  "Coagulase_negative_staphylococci" = "Coagulase negative staphylococci",
+  "Streptococcus_pneumoniae" = "Streptococcus pneumoniae",
+  "Streptococcus_pyogenes" = "Streptococcus pyogenes",
+  "Streptococcus_agalactiae" = "Streptococcus agalactiae",
+  "Beta_haemolytic_streptococci_group_C_G" = "Streptococcus dysgalactiae",
+  "Viridans_and_non_haemolytic_streptococci" = "Viridans and non-haemolytic streptococci",
+  "Enterococcus_faecalis" = "Enterococcus faecalis",
+  "Enterococcus_faecium" = "Enterococcus faecium",
+  "Other_Gram_positive" = "Other Gram positive",
+  "Escherichia_coli" = "Escherichia coli",
+  "Klebsiella_spp" = "Klebsiella spp.",
+  "Enterobacter_spp" = "Enterobacter spp.",
+  "Proteus_spp" = "Proteus spp.",
+  "Other_Enterobacteriaceae" = "Other Enterobacterales",
+  "Pseudomonas_spp" = "Pseudomonas spp.",
+  "Acinetobacter_spp" = "Acinetobacter spp.",
+  "Other_Gram_negatives_aerobic_bacteria" = "Other Gram negatives (aerobic)",
+  "Bacteroides_spp" = "Bacteroides spp.",
+  "Other_anaerobic_bacteria" = "Other anaerobic bacteria",
+  "Yeasts" = "Yeasts"
+)
+
+# Reshape data from wide to long, but use the _rate variables
+df_species_long <- data %>%
+  pivot_longer(
+    cols = all_of(paste0(species_vars, "_rate")),
+    names_to = "Species",
+    values_to = "Rate_per_100k"
+  ) %>%
+  # Strip "_rate" suffix to match the species_labels keys
+  mutate(
+    Species = sub("_rate$", "", Species),
+    Species_clean = species_labels[Species]
+  )
+
+# Identify top 7 species in 2024 by rate
+top_species_2024 <- df_species_long %>%
+  filter(Year == 2024) %>%
+  group_by(Species_clean) %>%
+  summarise(Total = sum(Rate_per_100k, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Total)) %>%
+  slice_head(n = 7) %>%
+  pull(Species_clean)
+
+# Ensure Streptococcus pneumoniae is included
+top8_species <- union(top_species_2024, "Streptococcus pneumoniae")
+
+# Order species by 2024 rates for consistent factor ordering
+species_order_all <- df_species_long %>%
+  filter(Year == 2024) %>%
+  group_by(Species_clean) %>%
+  summarise(Total = sum(Rate_per_100k, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Total)) %>%
+  pull(Species_clean)
+
+df_species_long <- df_species_long %>%
+  mutate(Species_clean = factor(Species_clean, levels = species_order_all))
+
+# Plot top 8 species
+fig_top8 <- df_species_long %>%
+  filter(Species_clean %in% top8_species) %>%
+  ggplot(aes(x = Year, y = Rate_per_100k, colour = Species_clean)) +
+  geom_line(size = 1.2, alpha = 0.9) +
+  scale_colour_viridis_d(option = "D", begin = 0.1, end = 0.9) +
+  labs(
+    title = "A",
+    y = "Isolates per 100,000 population",
+    x = NULL,
+    colour = "Species"
+  ) +
+  theme_classic() +
+  guides(colour = guide_legend(ncol = 1))
+
+# Plot remaining species
+fig_other <- df_species_long %>%
+  filter(!Species_clean %in% top8_species) %>%
+  ggplot(aes(x = Year, y = Rate_per_100k, colour = Species_clean)) +
+  geom_line(size = 1.2, alpha = 0.9) +
+  scale_colour_viridis_d(option = "D", begin = 0.1, end = 0.9) +
+  labs(
+    title = "B",
+    y = "Isolates per 100,000 population",
+    x = NULL,
+    colour = "Species"
+  ) +
+  theme_classic() +
+  guides(colour = guide_legend(ncol = 1))
+
+# Combine plots
+figure_1 <- fig_top8 / fig_other
+
+figure_1
+
+ggsave("figure_1.png", figure_1, width = 14, height = 20, scale = 0.67)
+
+```
+
+## Figure 2
+
+```{r figure 2, fig.width=14, fig.height=10,echo = F, warning=FALSE}
+
+# 1) Clean label map 
+species_labels <- c(
+  "Staphylococcus_aureus" = "Staphylococcus aureus",
+  "Coagulase_negative_staphylococci" = "Coagulase negative staphylococci",
+  "Streptococcus_pneumoniae" = "Streptococcus pneumoniae",
+  "Streptococcus_pyogenes" = "Streptococcus pyogenes",
+  "Streptococcus_agalactiae" = "Streptococcus agalactiae",
+  "Beta_haemolytic_streptococci_group_C_G" = "Streptococcus dysgalactiae",
+  "Viridans_and_non_haemolytic_streptococci" = "Viridans and non-haemolytic streptococci",
+  "Enterococcus_faecalis" = "Enterococcus faecalis",
+  "Enterococcus_faecium" = "Enterococcus faecium",
+  "Other_Gram_positive" = "Other Gram positive",
+  "Escherichia_coli" = "Escherichia coli",
+  "Klebsiella_spp" = "Klebsiella spp.",
+  "Enterobacter_spp" = "Enterobacter spp.",
+  "Proteus_spp" = "Proteus spp.",
+  "Other_Enterobacteriaceae" = "Other Enterobacterales",
+  "Pseudomonas_spp" = "Pseudomonas spp.",
+  "Acinetobacter_spp" = "Acinetobacter spp.",
+  "Other_Gram_negatives_aerobic_bacteria" = "Other Gram negatives (aerobic)",
+  "Bacteroides_spp" = "Bacteroides spp.",
+  "Other_anaerobic_bacteria" = "Other anaerobic bacteria",
+  "Yeasts" = "Yeasts"
+)
+
+# 2) Long data with ALL species, applying your display labels
+df_all <- data %>%
+  select(Year, all_of(species_vars)) %>%
+  pivot_longer(-Year, names_to = "Species_raw", values_to = "Count") %>%
+  mutate(
+    Species = recode(Species_raw, !!!species_labels)  # use your labels
+  )
+
+# 3) Order species by abundance in the last year (helps label stacking)
+last_year <- max(df_all$Year, na.rm = TRUE)
+species_levels <- df_all %>%
+  filter(Year == last_year) %>%
+  group_by(Species) %>%
+  summarise(Total = sum(Count, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Total)) %>%
+  pull(Species)
+
+df_all <- df_all %>% mutate(Species = factor(Species, levels = species_levels))
+
+# 4) Colour palette for ALL species
+set.seed(123)
+colour_map <- setNames(sample(viridis(length(species_levels))), species_levels)
+
+# 5) Base sankey-bump with extra right-side room and no legend
+base_plot_all <- ggplot(
+  df_all,
+  aes(x = Year, node = Species, value = Count, fill = Species, label = Species)
+) +
+  geom_sankey_bump(color = "white", alpha = 0.9) +
+  scale_fill_manual(values = colour_map, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.08))) +  # add space on right
+  theme_classic(base_size = 12) +
+  labs(x = NULL, y = NULL) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.margin = margin(10, 130, 10, 20) # <- expand right margin
+  )
+
+# 6) End positions for ALL streams (to place labels at the right edge)
+end_pos_all <- ggplot_build(base_plot_all)$data[[1]] %>%
+  group_by(label) %>%
+  filter(x == max(x)) %>%
+  summarise(x = mean(x), y = mean(y), .groups = "drop") %>%
+  rename(Species = label) %>%
+  mutate(label_text = Species)  # no counts
+
+# 7) Final figure: colour-matched labels, no clipping
+figure_2_all <- base_plot_all +
+  geom_shadowtext(
+    data = end_pos_all,
+    aes(x = x, y = y, label = label_text, colour = Species),
+    bg.colour = "white",
+    size = 3.2,
+    fontface = "bold",
+    hjust = 0,
+    nudge_x = 0.35,          # push slightly right of stream end
+    inherit.aes = FALSE
+  ) +
+  scale_colour_manual(values = colour_map, guide = "none") +
+  coord_cartesian(clip = "off")  # keep labels visible beyond panel
+
+figure_2_all
+
+ggsave("figure_2.png", figure_2_all, width = 18, height = 14, scale = 0.67)
+
+```
+
+## Figure 3
+
+```{r figure 3, echo = F}
+
+# 1) Fit age-standardised models
+# Incidence model (offset: population)
+model_inc_adj <- glm.nb(
+  Total_isolates ~ rcs(Year, 4) + Age_70_pct + offset(log(Population_size)),
+  data = data
+)
+
+# Positivity model (offset: total blood cultures)
+model_pos_adj <- glm.nb(
+  Total_isolates ~ rcs(Year, 4) + Age_70_pct + offset(log(Total_blood_cultures)),
+  data = data
+)
+
+# 2) Predictions and CIs on the link scale, then back-transform
+link_inc <- predict(model_inc_adj, type = "link", se.fit = TRUE)
+link_pos <- predict(model_pos_adj, type = "link", se.fit = TRUE)
+
+data <- data %>%
+  mutate(
+    # incidence per 100k
+    fit_inc = exp(link_inc$fit) / Population_size * 1e5,
+    lwr_inc = exp(link_inc$fit - 1.96 * link_inc$se.fit) / Population_size * 1e5,
+    upr_inc = exp(link_inc$fit + 1.96 * link_inc$se.fit) / Population_size * 1e5,
+
+    # positivity as percent
+    fit_pos_pct = exp(link_pos$fit) / Total_blood_cultures * 100,
+    lwr_pos_pct = exp(link_pos$fit - 1.96 * link_pos$se.fit) / Total_blood_cultures * 100,
+    upr_pos_pct = exp(link_pos$fit + 1.96 * link_pos$se.fit) / Total_blood_cultures * 100,
+
+    # observed incidence (kept for context; not shown in legend)
+    obs_incidence = Total_isolates / Population_size * 1e5
+  )
+
+# 3) Scale factor to overlay positivity (percent) on the left axis
+#    Choose multiplier so the maxima of both series are comparable on the left axis.
+m <- max(data$upr_inc, na.rm = TRUE) / max(data$upr_pos_pct, na.rm = TRUE)
+
+# 4) Plot: left y = incidence per 100k; right y = positivity (%)
+figure_3 <- ggplot(data, aes(x = Year)) +
+  # ribbons
+  geom_ribbon(aes(ymin = lwr_inc, ymax = upr_inc, x = Year),
+              fill = "#440154", alpha = 0.25, inherit.aes = FALSE) +
+  geom_ribbon(aes(ymin = lwr_pos_pct * m, ymax = upr_pos_pct * m, x = Year),
+              fill = "#21908C", alpha = 0.20, inherit.aes = FALSE) +
+
+  # modelled lines (legend)
+  geom_line(aes(y = fit_inc, colour = "Estimated incidence rate (age-standardised)"), linewidth = 1.2) +
+  geom_line(aes(y = fit_pos_pct * m, colour = "Estimated positivity rate (age-standardised)"), linewidth = 1.2) +
+
+  # observed incidence for context (no legend)
+  geom_line(aes(y = obs_incidence, colour = "Observed incidence rate"), linewidth = 1) +
+
+  scale_colour_manual(
+    name = NULL,
+    values = c(
+      "Observed incidence rate" = "black",
+      "Estimated incidence rate (age-standardised)" = "#440154",
+      "Estimated positivity rate (age-standardised)" = "#21908C"
+    )
+  ) +
+  scale_y_continuous(
+    name = "Incidence per 100,000 population",
+    sec.axis = sec_axis(~ . / m, name = "Estimated positivity (%)")
+  ) +
+  labs(x = "Year") +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank()
+  )
+
+figure_3
+ggsave("figure_3.png", figure_3, width = 8, height = 10, dpi = 300)
+
+```
+
+## Spline test
+
+```{r spline test}
+
+# This is how I have selected the number of knots and type of splines (testing natural splines vs restricted cubic splines)
+
+# Fit and evaluate models
+fit_spline_model <- function(type, knots_n) {
+  tryCatch({
+    if (type == "ns") {
+      model <- glm.nb(Total_isolates ~ ns(Year, df = knots_n - 1) + offset(log(Population_size)), data = data)
+    } else if (type == "rcs") {
+      model <- glm.nb(Total_isolates ~ rcs(Year, knots_n) + offset(log(Population_size)), data = data)
+    }
+    tibble(type = type,
+       knots = if (type == "ns") knots_n - 1 else knots_n,
+       AIC = AIC(model))
+  }, error = function(e) {
+    tibble(type = type, knots = knots_n, AIC = NA_real_)
+  })
+}
+
+# Test grid
+spline_grid <- expand.grid(
+  type = c("ns", "rcs"),
+  knots = 3:7
+)
+
+# Evaluate
+spline_results <- spline_grid %>%
+  pmap_dfr(~fit_spline_model(..1, ..2)) %>%
+  arrange(AIC)
+
+print(spline_results) ## Restricted cubic splines with 4 knots have the best fit
+
+```
+
+
+## Supplementary figure 1
+
+```{r supplementary figure 1, echo = F}
+
+decreasing_vars <- c(
+  "Bed_days_rate",            # Hospital bed-days
+  "Hospital_stays_rate",      # Hospital stays
+  "Unique_patients_rate"      # Unique inpatients
+)
+
+increasing_vars <- c(
+  "Prednisolone_rate",                    # Prednisolone users
+  "Cancer_incidence_rate",                # New cancer diagnoses
+  "Haematopoietic_cancer_incidence_rate", # New haematologic cancer diagnoses
+  "Gastrointestinal_cancer_incidence_rate",# New gastrointestinal cancer diagnoses
+  "Total_blood_cultures_rate"            # Estimated blood cultures taken
+)
+
+# pretty labels
+rate_labels <- c(
+  Bed_days_rate = "Hospital bed-days (per 100,000)",
+  Hospital_stays_rate = "Hospital stays (per 100,000)",
+  Unique_patients_rate = "Unique inpatients (per 100,000)",
+  Prednisolone_rate = "Prednisolone users (per 100,000)",
+  Cancer_incidence_rate = "New cancer diagnoses (per 100,000)",
+  Haematopoietic_cancer_incidence_rate = "New haematologic cancer diagnoses (per 100,000)",
+  Gastrointestinal_cancer_incidence_rate = "New gastrointestinal cancer diagnoses (per 100,000)",
+  Total_blood_cultures_rate = "Estimated blood cultures taken (per 100,000)"
+)
+
+# helper to z-standardise, pivot and relabel
+mk_z <- function(df, vars) {
+  df %>%
+    select(Year, all_of(vars)) %>%
+    mutate(across(-Year, ~ as.numeric(scale(.x)), .names = "{.col}_z")) %>%
+    select(Year, ends_with("_z")) %>%
+    pivot_longer(-Year, names_to = "Indicator", values_to = "Value") %>%
+    mutate(
+      Indicator = str_remove(Indicator, "_z$"),
+      Indicator = unname(rate_labels[Indicator])
+    )
+}
+
+data_dec_z <- mk_z(data, decreasing_vars)
+data_inc_z <- mk_z(data, increasing_vars)
+
+common_theme <- theme_classic()
+
+p_dec <- ggplot(data_dec_z, aes(Year, Value, colour = Indicator)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_viridis_d(option = "D") +
+  labs(title = "A. Decreasing indicators",
+       x = NULL, y = "Standardised value (z-score)", colour = "Indicator") +
+  common_theme
+
+p_inc <- ggplot(data_inc_z, aes(Year, Value, colour = Indicator)) +
+  geom_line(linewidth = 1.1) +
+  scale_color_viridis_d(option = "D") +
+  labs(title = "B. Increasing indicators",
+       x = "Year", y = "Standardised value (z-score)", colour = "Indicator") +
+  common_theme
+
+supp_fig2_rates <- p_dec / p_inc + plot_layout(guides = "collect") &
+  theme(legend.position = "right") &
+  guides(colour = guide_legend(ncol = 1))
+
+supp_fig2_rates
+ggsave("supp_fig2_rates.png", supp_fig2_rates, width = 12, height = 8, dpi = 300)
+
+```
+
+## Supplementary figure 3
+
+```{r supplementary figure 3, fig.width=14, fig.height=10, echo = F}
+
+# Supplementary Figure 3: Correlation matrix for contextual indicators
+# Create readable labels for variables
+labelled_corr_data <- data %>%
+  dplyr::select(all_of(contextual_vars)) %>%
+  rename(
+    "Population size" = Population_size,
+    "Proportion aged ≥70" = Age_70_pct,
+    "Hospital bed-days" = Bed_days,
+    "Unique inpatients" = Unique_patients,
+    "Hospital stays" = Hospital_stays,
+    "Prednisolone users" = Prednisolone,
+    "New cancer diagnoses" = Cancer_incidence,
+    "New haematologic cancer diagnoses" = Haematopoietic_cancer_incidence
+  ) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  drop_na()
+
+# Plot the correlation matrix
+supp_fig3 <- ggpairs(
+  labelled_corr_data,
+  upper = list(continuous = wrap("cor", size = 3)),
+  diag = list(continuous = "densityDiag"),
+  lower = list(
+    continuous = wrap("smooth", colour = viridis(1, option = "D"))
+  )
+) +
+  theme_classic()
+
+supp_fig3
+
+ggsave("supp_fig3.png", supp_fig3, width = 20, height = 20)
+
+```
+
+## Supplementary figure 4
+
+```{r supplementary material 4, fig.width=12, fig.height=6, echo=F}
+
+# Prepare data: split Rikshospitalet into early and later periods
+hospital_df <- data %>%
+  mutate(
+    Blood_cultures_Rikshospitalet_early = ifelse(Year <= 2007, Blood_cultures_Rikshospitalet, NA),
+    Blood_cultures_Rikshospitalet = ifelse(Year >= 2007, Blood_cultures_Rikshospitalet, NA)  # exclude 2005–2006 from main
+  ) %>%
+  select(Year,
+         Blood_cultures_Levanger, Blood_cultures_Molde, Blood_cultures_Trondheim, 
+         Blood_cultures_Ålesund, Blood_cultures_Tromsø, Blood_cultures_Tromsø_75, Blood_cultures_Tromsø_50,
+         Blood_cultures_Rikshospitalet, Blood_cultures_Rikshospitalet_early,
+         Blood_cultures_Ullevål)
+
+# Reshape and rename hospitals
+hospital_df_long <- hospital_df %>%
+  pivot_longer(-Year, names_to = "Hospital", values_to = "Count") %>%
+  mutate(Hospital = dplyr::recode(Hospital,
+    "Blood_cultures_Levanger" = "Levanger",
+    "Blood_cultures_Molde" = "Molde",
+    "Blood_cultures_Trondheim" = "Trondheim",
+    "Blood_cultures_Ålesund" = "Ålesund",
+    "Blood_cultures_Tromsø" = "Tromsø",
+    "Blood_cultures_Tromsø_75" = "Tromsø, 75 %",
+    "Blood_cultures_Tromsø_50" = "Tromsø, 50 %",
+    "Blood_cultures_Rikshospitalet" = "Rikshospitalet",
+    "Blood_cultures_Rikshospitalet_early" = "Rikshospitalet (estimated)",
+    "Blood_cultures_Ullevål" = "Ullevål"
+  ))
+
+# Assign linetypes
+hospital_df_long <- hospital_df_long %>%
+  mutate(
+    linetype_year = case_when(
+      Hospital == "Rikshospitalet (estimated)" ~ "dashed",
+      Hospital == "Tromsø, 75 %" ~ "dashed",
+      Hospital == "Tromsø, 50 %" ~ "dotted",
+      TRUE ~ "solid"
+    )
+  )
+
+# Define colour map
+hospitals_main <- c("Levanger", "Molde", "Trondheim", "Ålesund", "Tromsø", "Rikshospitalet", "Ullevål")
+colour_map <- setNames(viridis(length(hospitals_main)), hospitals_main)
+colour_map <- c(
+  colour_map,
+  "Tromsø, 75 %" = unname(colour_map["Tromsø"]),
+  "Tromsø, 50 %" = unname(colour_map["Tromsø"]),
+  "Rikshospitalet (estimated)" = unname(colour_map["Rikshospitalet"])
+)
+
+# Panel A: hospital-level trends (your existing plot)
+panel_a <- ggplot(hospital_df_long, aes(x = Year, y = Count, colour = Hospital, linetype = linetype_year)) +
+  geom_line(linewidth = 1.1) +
+  scale_colour_manual(values = colour_map) +
+  scale_linetype_manual(
+    values = c("solid" = "solid", "dashed" = "dashed", "dotted" = "dotted"),
+    guide = "none"
+  ) +
+  labs(
+    x = "Year",
+    y = "Number of blood cultures",
+    colour = "Hospital",
+    title = "A"
+  ) +
+  theme_classic()
+
+# Panel B: national total with confidence interval
+panel_b <- ggplot(data, aes(x = Year, y = Total_blood_cultures)) +
+  geom_ribbon(aes(x = Year,
+                  ymin = Total_blood_cultures_LCL,
+                  ymax = Total_blood_cultures_UCL),
+              alpha = 0.2, inherit.aes = FALSE) +
+  geom_line(linewidth = 1.8, colour = "black") +
+  labs(
+    x = "Year",
+    y = "Estimated total blood cultures",
+    title = "B"
+  ) +
+  theme_classic()
+
+# Combine panels
+supp_fig4 <- panel_a + panel_b + plot_layout(ncol = 2)
+
+# Save
+ggsave("supp_fig4.png", supp_fig4, width = 18, height = 6)
+
+supp_fig4
+
+```
+
+```{r supplementary figure 5}
+
+# Stacked area charts
+
+# Key for CoNS in species_vars
+cons_key <- "Coagulase_negative_staphylococci"
+
+# Long data with species counts and clean labels
+df_species_long <- data %>%
+  select(Year, all_of(species_vars)) %>%
+  pivot_longer(-Year, names_to = "Species", values_to = "Count") %>%
+  mutate(Species_clean = species_labels[Species])
+
+# Order legend by average share across years (stable ordering)
+order_levels <- df_species_long %>%
+  group_by(Year) %>%
+  mutate(total_y = sum(Count, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(Species_clean) %>%
+  summarise(avg_share = mean(Count / total_y, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(avg_share)) %>%
+  pull(Species_clean)
+
+df_species_long <- df_species_long %>%
+  mutate(Species_clean = factor(Species_clean, levels = order_levels))
+
+# Consistent but scrambled colour map across both panels
+set.seed(123)  
+colour_map <- setNames(
+  sample(viridis(length(levels(df_species_long$Species_clean)))),
+  levels(df_species_long$Species_clean)
+)
+
+# make sure both panels share exactly the same fill scale
+common_fill <- scale_fill_manual(values = colour_map, drop = FALSE)
+
+panel_all <- ggplot(df_species_long, aes(Year, Count, fill = Species_clean)) +
+  geom_area(position = "fill", alpha = 0.95) +
+  common_fill +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "A.",
+       x = NULL, y = "Proportion of all bacteraemia", fill = "Species") +
+  theme_classic() +
+  guides(fill = guide_legend(ncol = 1))   # two legend columns
+
+panel_no_cons <- df_species_long %>%
+  filter(Species != cons_key) %>%
+  ggplot(aes(Year, Count, fill = Species_clean)) +
+  geom_area(position = "fill", alpha = 0.95) +
+  common_fill +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "B.",
+       x = NULL, y = "Proportion of all bacteraemia") +
+  theme_classic() +
+  theme(legend.position = "none")         # hide legend here
+
+# Arrange with one shared legend on the right
+supp_area_fig <- ggarrange(
+  panel_all, panel_no_cons,
+  ncol = 1, nrow = 2,
+  common.legend = TRUE, legend = "right"
+)
+
+supp_area_fig
+
+ggsave("supp_area_distribution.png", supp_area_fig, width = 16, height = 10, dpi = 300)
+
+```
+
+```{r Shannon index}
+
+shannon_by_year <- df_species_counts %>%
+  group_by(Year) %>%
+  summarise(
+    H = diversity(Count, index = "shannon"),              # Shannon index H'
+    #S = sum(count > 0),                                   # Number of observed species categories
+    #J = H / log(S),                                       # Pielou's evenness
+    D1 = exp(H)                                           # Effective number of categories (Hill number)
+  ) %>%
+  ungroup()
+
+# Preview results
+print(shannon_by_year)
+
+dominance_by_year <- df_species_counts %>%
+  group_by(Year) %>%
+  mutate(
+    Total = sum(Count),
+    p = Count / Total
+  ) %>%
+  summarise(
+    Berger_Parker = max(p),                                    # Share of most common species
+    Simpson_D     = sum(p^2),                                  # Simpson dominance
+    Top3_share    = sum(sort(p, decreasing = TRUE)[1:min(3, n())]),
+    Top5_share    = sum(sort(p, decreasing = TRUE)[1:min(5, n())]),
+    N_species     = n(),                                       # Number of species categories
+    .groups = "drop"
+  )
+
+# View results
+print(dominance_by_year)
+
+
+```
+
